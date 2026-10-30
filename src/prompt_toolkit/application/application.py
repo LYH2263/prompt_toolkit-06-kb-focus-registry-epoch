@@ -58,6 +58,7 @@ from prompt_toolkit.key_binding.key_bindings import (
     KeyBindings,
     KeyBindingsBase,
     KeysTuple,
+    RegistryGeneration,
     merge_key_bindings,
 )
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent, KeyProcessor
@@ -229,11 +230,23 @@ class Application(Generic[_AppResult]):
         self.style = style
         self.style_transformation = style_transformation
 
-        # Key bindings.
+        # Registry generation. This is the epoch of the "which key bindings
+        # are live right now" ledger. It is bound to this Application, to its
+        # layout focus and to the mounted key bindings registry: focus
+        # migrations (through the layout), re-mounts of `key_bindings` /
+        # `layout` and every fresh `run()` declare a generation boundary, so
+        # the next key pump can't resolve against a ledger cached for an
+        # older pane/modal/tree.
+        self.registry_generation = RegistryGeneration()
+
+        # Key bindings. (The property setter declares a generation on
+        # re-mount.)
         self.key_bindings = key_bindings
         self._default_bindings = load_key_bindings()
         self._page_navigation_bindings = load_page_navigation_bindings()
 
+        # The layout setter binds the layout's focus migrations to the
+        # registry generation.
         self.layout = layout
         self.clipboard = clipboard or InMemoryClipboard()
         self.full_screen: bool = full_screen
@@ -356,6 +369,62 @@ class Application(Generic[_AppResult]):
         )
 
     @property
+    def key_bindings(self) -> KeyBindingsBase | None:
+        """
+        The application level key bindings registry currently mounted on this
+        application.
+
+        Assigning a *different* registry re-mounts it and, because this is a
+        generation boundary, forces the next key pump to resolve against the
+        new registry instead of a focus merge cached for the previous one.
+        """
+        return self._mounted_key_bindings
+
+    @key_bindings.setter
+    def key_bindings(self, key_bindings: KeyBindingsBase | None) -> None:
+        previous = getattr(self, "_mounted_key_bindings", None)
+        self._mounted_key_bindings = key_bindings
+
+        if (
+            previous is not key_bindings
+            and getattr(self, "registry_generation", None) is not None
+        ):
+            self.registry_generation.bump()
+
+    @property
+    def layout(self) -> Layout:
+        """
+        The :class:`.Layout` currently mounted on this application. Re-mounting
+        a layout binds its focus migrations to this application's registry
+        generation and declares a generation boundary.
+        """
+        return self._mounted_layout
+
+    @layout.setter
+    def layout(self, layout: Layout) -> None:
+        previous = getattr(self, "_mounted_layout", None)
+        self._mounted_layout = layout
+
+        generation = getattr(self, "registry_generation", None)
+        if generation is not None:
+            layout.bind_registry_generation(generation)
+            if previous is not layout:
+                generation.bump()
+
+    def bump_key_bindings_generation(self) -> None:
+        """
+        Declare a registry generation boundary for the mounted key bindings.
+
+        Hosts call this when something that cannot be observed through a
+        child registry ``_version`` changed: for instance a dynamic
+        ``is_global``/activity filter flipped while a modal is up, or a
+        custom registry swapped its contents by reference. The next key pump
+        (including a multi-key sequence currently waiting for its timeout
+        flush) resolves against the new ledger.
+        """
+        self.registry_generation.bump()
+
+    @property
     def color_depth(self) -> ColorDepth:
         """
         The active :class:`.ColorDepth`.
@@ -412,6 +481,10 @@ class Application(Generic[_AppResult]):
         # returning, and when we have multiple buffers, we clearly want the
         # content in the other buffers to remain unchanged between several
         # calls of `run`. (And the same is true for the focus stack.)
+
+        # A fresh run is a recoverable generation boundary: merges cached by
+        # a previous (possibly nested/inner) run must never serve the new run.
+        self.registry_generation.bump()
 
         self.exit_style = ""
 
@@ -1432,8 +1505,11 @@ class _CombinedRegistry(KeyBindingsBase):
 
     def __init__(self, app: Application[_AppResult]) -> None:
         self.app = app
+        # The application's registry generation. This is read by the
+        # `KeyProcessor` (duck typed) for its multi-key timeout cut-over.
+        self.generation = app.registry_generation
         self._cache: SimpleCache[
-            tuple[Window, frozenset[UIControl]], KeyBindingsBase
+            tuple[Window, frozenset[UIControl], int], KeyBindingsBase
         ] = SimpleCache()
 
     @property
@@ -1456,13 +1532,15 @@ class _CombinedRegistry(KeyBindingsBase):
         `UIControl` with all the parent controls and the global key bindings.
         """
         key_bindings = []
-        collected_containers = set()
+        focus_chain: set[Container] = set()
+        generation = self.generation
 
         # Collect key bindings from currently focused control and all parent
-        # controls. Don't include key bindings of container parent controls.
+        # controls, up to (and including) the nearest modal container. These
+        # contribute their *normal* key bindings.
         container: Container = current_window
         while True:
-            collected_containers.add(container)
+            focus_chain.add(container)
             kb = container.get_key_bindings()
             if kb is not None:
                 key_bindings.append(kb)
@@ -1476,12 +1554,19 @@ class _CombinedRegistry(KeyBindingsBase):
             else:
                 container = parent
 
-        # Include global bindings (starting at the top-model container).
-        for c in walk(container):
-            if c not in collected_containers:
+        # Every container that is NOT on the active focus chain contributes
+        # its *global* bindings only. Walking the whole layout root (rather
+        # than stopping at the modal root) means that normal bindings of
+        # ancestors/siblings stay truncated by a modal, while their truly
+        # global bindings remain alive -- including globals attached above
+        # the modal boundary and inside other modal subtrees.
+        for c in walk(self.app.layout.container):
+            if c not in focus_chain:
                 kb = c.get_key_bindings()
                 if kb is not None:
-                    key_bindings.append(GlobalOnlyKeyBindings(kb))
+                    key_bindings.append(
+                        GlobalOnlyKeyBindings(kb, generation=generation)
+                    )
 
         # Add App key bindings
         if self.app.key_bindings:
@@ -1492,6 +1577,7 @@ class _CombinedRegistry(KeyBindingsBase):
             ConditionalKeyBindings(
                 self.app._page_navigation_bindings,
                 self.app.enable_page_navigation_bindings,
+                generation=generation,
             )
         )
         key_bindings.append(self.app._default_bindings)
@@ -1500,13 +1586,22 @@ class _CombinedRegistry(KeyBindingsBase):
         # last. They need priority.
         key_bindings = key_bindings[::-1]
 
-        return merge_key_bindings(key_bindings)
+        return merge_key_bindings(key_bindings, generation=generation)
 
     @property
     def _key_bindings(self) -> KeyBindingsBase:
         current_window = self.app.layout.current_window
         other_controls = list(self.app.layout.find_all_controls())
-        key = current_window, frozenset(other_controls)
+        # The registry epoch is part of the cache key. Focus migrations,
+        # modal in/out and key bindings reference replacements declare a
+        # generation, so a stale focus merge can never be served for a new
+        # ledger. Without any boundary, the epoch is constant and the key is
+        # equivalent to the historical (window, controls) key.
+        key = (
+            current_window,
+            frozenset(other_controls),
+            self.generation.epoch,
+        )
 
         return self._cache.get(
             key, lambda: self._create_key_bindings(current_window, other_controls)

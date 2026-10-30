@@ -5,6 +5,7 @@ from .key_bindings import (
     DynamicKeyBindings,
     KeyBindings,
     KeyBindingsBase,
+    RegistryGeneration,
     merge_key_bindings,
 )
 from .key_processor import KeyPress, KeyPressEvent
@@ -15,6 +16,7 @@ __all__ = [
     "DynamicKeyBindings",
     "KeyBindings",
     "KeyBindingsBase",
+    "RegistryGeneration",
     "merge_key_bindings",
     # key_processor
     "KeyPress",

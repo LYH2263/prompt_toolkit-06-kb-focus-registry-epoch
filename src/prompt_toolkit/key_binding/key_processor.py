@@ -11,7 +11,7 @@ from __future__ import annotations
 import weakref
 from asyncio import Task, sleep
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit.application.current import get_app
@@ -20,7 +20,7 @@ from prompt_toolkit.filters.app import vi_navigation_mode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.utils import Event
 
-from .key_bindings import Binding, KeyBindingsBase
+from .key_bindings import Binding, KeyBindingsBase, RegistryGeneration
 
 if TYPE_CHECKING:
     from prompt_toolkit.application import Application
@@ -97,6 +97,9 @@ class KeyProcessor:
         self.after_key_press = Event(self)
 
         self._flush_wait_task: Task[None] | None = None
+        # Unsubscriber for the registry generation attached to the pending
+        # flush wait (or None when no generation is bound / no wait armed).
+        self._unsubscribe_generation: Callable[[], None] | None = None
 
         self.reset()
 
@@ -114,6 +117,16 @@ class KeyProcessor:
         #: Readline argument (for repetition of commands.)
         #: https://www.gnu.org/software/bash/manual/html_node/Readline-Arguments.html
         self.arg: str | None = None
+
+        # A reset is a hard cut-over: don't let a flush task/generation
+        # listener from a previous run (or a previous processor coroutine)
+        # feed this fresh state machine.
+        if self._flush_wait_task is not None:
+            self._flush_wait_task.cancel()
+            self._flush_wait_task = None
+        if self._unsubscribe_generation is not None:
+            self._unsubscribe_generation()
+            self._unsubscribe_generation = None
 
         # Start the processor coroutine.
         self._process_coroutine = self._process()
@@ -388,6 +401,13 @@ class KeyProcessor:
         Start a background coroutine with a timer. When this timeout expires
         and no key was pressed in the meantime, we flush all data in the queue
         and call the appropriate key binding handlers.
+
+        While a multi-key sequence is pending, this also watches the registry
+        generation exposed by the bindings (when any). If focus moves into a
+        modal, a global filter flips or the mounted key bindings change during
+        the wait window, the pending sequence is cut over to the new ledger on
+        the next event loop iteration (and the timeout flush would resolve it
+        against the current generation regardless).
         """
         app = get_app()
         timeout = app.timeoutlen
@@ -395,24 +415,72 @@ class KeyProcessor:
         if timeout is None:
             return
 
+        # The application's focus merge registry exposes its generation.
+        # Standalone `KeyProcessor` usage (plain KeyBindings) has none, in
+        # which case behaviour is exactly the historical timeout behaviour.
+        generation: RegistryGeneration | None = getattr(
+            self._bindings, "generation", None
+        )
+        if not isinstance(generation, RegistryGeneration):
+            generation = None
+
+        unsubscribe: Callable[[], None] | None = None
+
         async def wait() -> None:
             "Wait for timeout."
-            # This sleep can be cancelled. In that case we don't flush.
-            await sleep(timeout)
+            try:
+                # This sleep can be cancelled. In that case we don't flush.
+                await sleep(timeout)
 
-            if len(self.key_buffer) > 0:
-                # (No keys pressed in the meantime.)
-                flush_keys()
+                if len(self.key_buffer) > 0:
+                    # (No keys pressed in the meantime.)
+                    flush_keys()
+            finally:
+                # Detach this wait's generation listener.
+                if (
+                    unsubscribe is not None
+                    and self._unsubscribe_generation is unsubscribe
+                ):
+                    self._unsubscribe_generation = None
+                    unsubscribe()
 
         def flush_keys() -> None:
             "Flush keys."
             self.feed(_Flush)
             self.process_keys()
 
+        def generation_changed() -> None:
+            "Cut the pending prefix over to the new ledger."
+            # Only act while this wait is still the armed one and there is
+            # something pending to resolve.
+            if self._flush_wait_task is not task:
+                return
+            task.cancel()
+            if len(self.key_buffer) > 0:
+                flush_keys()
+
+        def on_generation_change(epoch: int) -> None:
+            # The boundary can be raised from inside another key pump (e.g. a
+            # handler moves focus into a modal). The processor generator is
+            # not re-entrant while it is being sent, so defer the cut-over.
+            loop = app.loop
+            if loop is None or loop.is_closed():
+                return
+            loop.call_soon(generation_changed)
+
         # Automatically flush keys.
         if self._flush_wait_task:
             self._flush_wait_task.cancel()
-        self._flush_wait_task = app.create_background_task(wait())
+        if self._unsubscribe_generation is not None:
+            self._unsubscribe_generation()
+            self._unsubscribe_generation = None
+
+        task = app.create_background_task(wait())
+        self._flush_wait_task = task
+
+        if generation is not None and len(self.key_buffer) > 0:
+            unsubscribe = generation.subscribe(on_generation_change)
+            self._unsubscribe_generation = unsubscribe
 
     def send_sigint(self) -> None:
         """

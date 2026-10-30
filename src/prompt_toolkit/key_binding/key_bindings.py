@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 __all__ = [
     "NotImplementedOrNone",
     "Binding",
+    "RegistryGeneration",
     "KeyBindingsBase",
     "KeyBindings",
     "ConditionalKeyBindings",
@@ -144,6 +145,79 @@ class Binding:
 
 # Sequence of keys presses.
 KeysTuple = tuple[Keys | str, ...]
+
+
+class RegistryGeneration:
+    """
+    Monotonic generation (epoch) of the "which key bindings are live right now"
+    ledger.
+
+    A generation is bound to one :class:`~prompt_toolkit.application.Application`
+    -- to its layout focus and to its mounted ``key_bindings`` registry. Hosts
+    (complex layouts, toolbars, dialogs) use it as a *recoverable boundary*:
+    when the focus migrates (in particular into or out of a modal container),
+    when an application level registry is replaced, or when a filter such as
+    ``is_global`` flips outside of a child registry version bump, a new
+    generation forces the next key pump to resolve against the current ledger
+    instead of a privately cached merge.
+
+    Proxies (:class:`ConditionalKeyBindings`, :class:`GlobalOnlyKeyBindings`,
+    :func:`merge_key_bindings`) can be bound to a generation. As long as
+    nothing is bound, the epoch is a constant and their observable behaviour
+    is exactly the same as without generations: the child registry
+    ``_version`` is the only invalidation signal.
+
+    Listeners are plain callables receiving the new epoch. They are invoked
+    synchronously by :meth:`bump`, so subscribers (e.g. the multi-key timeout
+    of the :class:`~prompt_toolkit.key_binding.key_processor.KeyProcessor`)
+    must defer any non-reentrant work to the event loop.
+    """
+
+    __slots__ = ("_epoch", "_listeners")
+
+    def __init__(self) -> None:
+        self._epoch = 0
+        self._listeners: list[Callable[[int], None]] = []
+
+    @property
+    def epoch(self) -> int:
+        "Current generation. Increases on every :meth:`bump` call."
+        return self._epoch
+
+    def bump(self) -> int:
+        """
+        Declare a generation boundary. Every cache/proxy bound to this
+        generation has to rebuild on its next query, and every pending
+        multi-key resolution has to cut over to the new ledger.
+
+        Returns the new epoch.
+        """
+        self._epoch += 1
+        epoch = self._epoch
+
+        # Listeners may unsubscribe while being notified; iterate over a copy.
+        for listener in list(self._listeners):
+            listener(epoch)
+
+        return epoch
+
+    def subscribe(self, listener: Callable[[int], None]) -> Callable[[], None]:
+        """
+        Register a listener for generation boundaries. Returns a callable
+        that unsubscribes when called.
+        """
+        self._listeners.append(listener)
+
+        def unsubscribe() -> None:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def __repr__(self) -> str:
+        return f"RegistryGeneration(epoch={self._epoch})"
 
 
 class KeyBindingsBase(metaclass=ABCMeta):
@@ -492,10 +566,24 @@ class _Proxy(KeyBindingsBase):
     Common part for ConditionalKeyBindings and _MergedKeyBindings.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, generation: RegistryGeneration | None = None
+    ) -> None:
         # `KeyBindings` to be synchronized with all the others.
         self._bindings2: KeyBindingsBase = KeyBindings()
         self._last_version: Hashable = ()
+
+        # Optional registry generation. When bound, its epoch becomes part of
+        # the cache version, so a generation boundary forces a rebuild even
+        # when none of the child registries changed `_version` (e.g. an
+        # `is_global` filter flipped, or a focus merge crossed a modal).
+        # When unbound, the epoch is a constant and behaviour is identical to
+        # a proxy without generations.
+        self.generation = generation
+
+    def _generation_epoch(self) -> Hashable:
+        generation = self.generation
+        return generation.epoch if generation is not None else 0
 
     def _update_cache(self) -> None:
         """
@@ -541,19 +629,30 @@ class ConditionalKeyBindings(_Proxy):
 
     :param registries: List of :class:`.KeyBindings` objects.
     :param filter: :class:`~prompt_toolkit.filters.Filter` object.
+    :param generation: Optional :class:`.RegistryGeneration`. When bound, a
+        generation boundary forces the binding copies to be rebuilt, even if
+        the child registry version didn't change. The copied filters
+        themselves are always evaluated live at match time.
     """
 
     def __init__(
-        self, key_bindings: KeyBindingsBase, filter: FilterOrBool = True
+        self,
+        key_bindings: KeyBindingsBase,
+        filter: FilterOrBool = True,
+        *,
+        generation: RegistryGeneration | None = None,
     ) -> None:
-        _Proxy.__init__(self)
+        _Proxy.__init__(self, generation=generation)
 
         self.key_bindings = key_bindings
         self.filter = to_filter(filter)
 
     def _update_cache(self) -> None:
         "If the original key bindings was changed. Update our copy version."
-        expected_version = self.key_bindings._version
+        expected_version = (
+            self.key_bindings._version,
+            self._generation_epoch(),
+        )
 
         if self._last_version != expected_version:
             bindings2 = KeyBindings()
@@ -584,10 +683,18 @@ class _MergedKeyBindings(_Proxy):
     behaves as if this is just one bigger :class:`.KeyBindings`.
 
     :param registries: List of :class:`.KeyBindings` objects.
+    :param generation: Optional :class:`.RegistryGeneration`. A generation
+        boundary forces the merged copy to be re-read from the registries,
+        even if none of them changed ``_version``.
     """
 
-    def __init__(self, registries: Sequence[KeyBindingsBase]) -> None:
-        _Proxy.__init__(self)
+    def __init__(
+        self,
+        registries: Sequence[KeyBindingsBase],
+        *,
+        generation: RegistryGeneration | None = None,
+    ) -> None:
+        _Proxy.__init__(self, generation=generation)
         self.registries = registries
 
     def _update_cache(self) -> None:
@@ -595,7 +702,10 @@ class _MergedKeyBindings(_Proxy):
         If one of the original registries was changed. Update our merged
         version.
         """
-        expected_version = tuple(r._version for r in self.registries)
+        expected_version = (
+            tuple(r._version for r in self.registries),
+            self._generation_epoch(),
+        )
 
         if self._last_version != expected_version:
             bindings2 = KeyBindings()
@@ -607,15 +717,22 @@ class _MergedKeyBindings(_Proxy):
             self._last_version = expected_version
 
 
-def merge_key_bindings(bindings: Sequence[KeyBindingsBase]) -> _MergedKeyBindings:
+def merge_key_bindings(
+    bindings: Sequence[KeyBindingsBase],
+    *,
+    generation: RegistryGeneration | None = None,
+) -> _MergedKeyBindings:
     """
     Merge multiple :class:`.Keybinding` objects together.
 
     Usage::
 
         bindings = merge_key_bindings([bindings1, bindings2, ...])
+
+    :param generation: Optional :class:`.RegistryGeneration` to bind this merge
+        to. A generation boundary forces a re-read of all registries.
     """
-    return _MergedKeyBindings(bindings)
+    return _MergedKeyBindings(bindings, generation=generation)
 
 
 class DynamicKeyBindings(_Proxy):
@@ -623,10 +740,18 @@ class DynamicKeyBindings(_Proxy):
     KeyBindings class that can dynamically returns any KeyBindings.
 
     :param get_key_bindings: Callable that returns a :class:`.KeyBindings` instance.
+    :param generation: Optional :class:`.RegistryGeneration` to bind this proxy
+        to. A generation boundary is part of the resolved version.
     """
 
-    def __init__(self, get_key_bindings: Callable[[], KeyBindingsBase | None]) -> None:
+    def __init__(
+        self,
+        get_key_bindings: Callable[[], KeyBindingsBase | None],
+        *,
+        generation: RegistryGeneration | None = None,
+    ) -> None:
         self.get_key_bindings = get_key_bindings
+        self.generation = generation
         self.__version = 0
         self._last_child_version = None
         self._dummy = KeyBindings()  # Empty key bindings.
@@ -634,7 +759,11 @@ class DynamicKeyBindings(_Proxy):
     def _update_cache(self) -> None:
         key_bindings = self.get_key_bindings() or self._dummy
         assert isinstance(key_bindings, KeyBindingsBase)
-        version = id(key_bindings), key_bindings._version
+        version = (
+            id(key_bindings),
+            key_bindings._version,
+            self._generation_epoch(),
+        )
 
         self._bindings2 = key_bindings
         self._last_version = version
@@ -644,10 +773,21 @@ class GlobalOnlyKeyBindings(_Proxy):
     """
     Wrapper around a :class:`.KeyBindings` object that only exposes the global
     key bindings.
+
+    :param generation: Optional :class:`.RegistryGeneration`. Whether a
+        binding counts as global is itself a (possibly dynamic) filter, so it
+        is re-snapshotted on every generation boundary as well as on child
+        registry version changes. Without a bound generation, the snapshot
+        only follows child registry versions, like before.
     """
 
-    def __init__(self, key_bindings: KeyBindingsBase) -> None:
-        _Proxy.__init__(self)
+    def __init__(
+        self,
+        key_bindings: KeyBindingsBase,
+        *,
+        generation: RegistryGeneration | None = None,
+    ) -> None:
+        _Proxy.__init__(self, generation=generation)
         self.key_bindings = key_bindings
 
     def _update_cache(self) -> None:
@@ -655,7 +795,10 @@ class GlobalOnlyKeyBindings(_Proxy):
         If one of the original registries was changed. Update our merged
         version.
         """
-        expected_version = self.key_bindings._version
+        expected_version = (
+            self.key_bindings._version,
+            self._generation_epoch(),
+        )
 
         if self._last_version != expected_version:
             bindings2 = KeyBindings()

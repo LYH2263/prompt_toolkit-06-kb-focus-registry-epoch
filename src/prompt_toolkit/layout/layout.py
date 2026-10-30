@@ -5,6 +5,7 @@ Wrapper for the layout.
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
+from typing import TYPE_CHECKING
 
 from prompt_toolkit.buffer import Buffer
 
@@ -16,6 +17,9 @@ from .containers import (
     to_container,
 )
 from .controls import BufferControl, SearchBufferControl, UIControl
+
+if TYPE_CHECKING:
+    from prompt_toolkit.key_binding.key_bindings import RegistryGeneration
 
 __all__ = [
     "Layout",
@@ -58,6 +62,17 @@ class Layout:
         # is rendered.  (UI elements have only references to their children.)
         self._child_to_parent: dict[Container, Container] = {}
 
+        # Focus generations. `_focus_generation` counts every focus migration
+        # on this layout. When a layout is mounted on an Application (through
+        # `bind_registry_generation`), focus migrations also declare a
+        # registry generation boundary, so that the next key pump resolves
+        # against the post-migration ledger (fresh modal truncation, fresh
+        # global-only selection) instead of a merge cached for the previous
+        # pane. Before an Application is bound, this is a pure local counter
+        # and nothing else changes.
+        self._focus_generation = 0
+        self._registry_generation: RegistryGeneration | None = None
+
         if focused_element is None:
             try:
                 self._stack.append(next(self.find_all_windows()))
@@ -70,6 +85,31 @@ class Layout:
 
         # List of visible windows.
         self.visible_windows: list[Window] = []  # List of `Window` objects.
+
+    def bind_registry_generation(
+        self, registry_generation: RegistryGeneration | None
+    ) -> None:
+        """
+        Bind this layout's focus migrations to the registry generation of an
+        :class:`~prompt_toolkit.application.Application`. Every subsequent
+        focus migration declares a generation boundary on it. Called by the
+        Application when it mounts this layout.
+        """
+        self._registry_generation = registry_generation
+
+    @property
+    def focus_generation(self) -> int:
+        "Monotonic counter, increased on every focus migration."
+        return self._focus_generation
+
+    def _declare_focus_generation(self) -> None:
+        """
+        Record a focus migration. When mounted on an Application, also declare
+        a registry generation boundary.
+        """
+        self._focus_generation += 1
+        if self._registry_generation is not None:
+            self._registry_generation.bump()
 
     def __repr__(self) -> str:
         return f"Layout({self.container!r}, current_window={self.current_window!r})"
@@ -217,6 +257,7 @@ class Layout:
     def current_window(self, value: Window) -> None:
         "Set the :class:`.Window` object to be currently focused."
         self._stack.append(value)
+        self._declare_focus_generation()
 
     @property
     def is_searching(self) -> bool:
@@ -302,6 +343,7 @@ class Layout:
         """
         if len(self._stack) > 1:
             self._stack = self._stack[:-1]
+            self._declare_focus_generation()
 
     def focus_next(self) -> None:
         """
